@@ -116,6 +116,8 @@ type AppState = Arc<Accounts>;
 
 #[tokio::main]
 async fn main() {
+    println!("Starting server...");
+
     let port = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -140,7 +142,7 @@ async fn main() {
         .route("/clientes/:id/extrato", get(get_transactions))
         .with_state(Arc::new(accounts));
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap();
 
