@@ -1,38 +1,43 @@
-version: "2"
+version: "3.5"
 
 services:
   api01: &api
     build: .
     hostname: api01
     restart: unless-stopped
-    networks:
-      - default
     environment:
-      - PORT=3000
+      - PORT=3001
+    ports:
+      - "3001:3001"
     deploy:
       resources:
         limits:
-          cpus: "0.15"
-          memory: "60MB"
+          cpus: "0.5"
+          memory: "200MB"
 
   api02:
     <<: *api
+    environment:
+      - PORT=3000
+    ports:
+      - "3000:3000"
     hostname: api2
 
-  nginx:
-    image: nginx:latest
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - api01
-      - api02
-    ports:
-      - "9999:9999"
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: "100MB"
+  # nginx:
+  #   image: nginx:latest
+  #   network_mode: host
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     - api01
+  #     - api02
+  #   ports:
+  #     - "9999:9999"
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "1"
+  #         memory: "100MB"
 
 networks:
   default:

@@ -1,44 +1,50 @@
 #include <arpa/inet.h>
+#include <asm-generic/errno.h>
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/poll.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "epoll_layer.h"
+
 #define PORT "9999"
-#define PORT_NUM 9999
 #define BACKLOG 10
 #define NUM_UPSTREAMS 2
+#define BUFFSIZE 4096
 
-#define da_init(da, size)                                                      \
-  do {                                                                         \
-    da->cap = 16;                                                              \
-    da->values = calloc(da->cap, size);                                        \
-    da->len = 0;                                                               \
-  } while (0)
+char *upstream_ports[] = {"3000", "3001"};
 
-#define da_append(da, value)                                                   \
-  do {                                                                         \
-    if (da->len == da->cap) {                                                  \
-      da->cap *= 2;                                                            \
-      da->values = realloc(da->values, da->cap * sizeof(da->values[0]));       \
-    }                                                                          \
-    da->values[da->len++] = value;                                             \
-  } while (0)
+typedef struct client_data_t {
+  char buf[BUFFSIZE];
+  epoll_handler_t *opposing;
+} client_data_t;
 
-int interrupt_flag = 0;
-size_t current_request = 0;
+void set_non_blocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    perror("fcntl get");
+    exit(EXIT_FAILURE);
+  }
 
-typedef struct da_fds {
-  size_t cap;
-  size_t len;
-  struct pollfd *values;
-} da_fds;
+  flags |= O_NONBLOCK;
+
+  int result = fcntl(fd, F_SETFL, flags);
+  if (result < 0) {
+    perror("fcntl set");
+    exit(EXIT_FAILURE);
+  }
+}
 
 int get_listener_socket(void) {
   struct addrinfo hints, *res;
@@ -66,6 +72,8 @@ int get_listener_socket(void) {
     return -1;
   }
 
+  set_non_blocking(sockfd);
+
   if (listen(sockfd, BACKLOG) < 0) {
     perror("Could not listen on port");
     return -1;
@@ -74,18 +82,10 @@ int get_listener_socket(void) {
   return sockfd;
 }
 
-void add_pfd(da_fds *fds, int newfd) {
-  struct pollfd newfd_data = (struct pollfd){
-      .events = POLLIN,
-      .fd = newfd,
-      .revents = 0,
-  };
-  da_append(fds, newfd_data);
-}
-
-void remove_pfd(da_fds *fds, int i) {
-  fds->values[i] = fds->values[fds->len - 1];
-  fds->len--;
+void remove_pfd(int epollfd, int fd, struct epoll_event *ev) {
+  if (epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, ev) == -1) {
+    perror("epoll del");
+  }
 }
 
 void *get_in_addr(struct sockaddr *sa) {
@@ -94,90 +94,6 @@ void *get_in_addr(struct sockaddr *sa) {
   }
 
   return &(((struct sockaddr_in6 *)sa)->sin6_addr);
-}
-
-void broadcast(da_fds *fds, int listener, int sender_fd, int num_bytes,
-               char *buf) {
-  for (int j = 0; j < fds->len; j++) {
-    int dest_fd = fds->values[j].fd;
-
-    // Except the listener and ourselves
-    if (dest_fd != listener && dest_fd != sender_fd) {
-      if (send(dest_fd, buf, num_bytes, 0) == -1) {
-        perror("send");
-      }
-    }
-  }
-}
-
-void accept_connection(int listener, da_fds *fds) {
-  struct sockaddr_storage remoteaddr;
-  socklen_t addrlen = sizeof(remoteaddr);
-
-  int newfd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);
-  if (newfd < 0) {
-    perror("Could not accept incoming connection");
-  }
-
-  add_pfd(fds, newfd);
-}
-
-void recv_and_redirect(da_fds *fds, int listener,
-                       int upstream_sockfds[NUM_UPSTREAMS]) {
-  char buf[4096];
-
-  for (;;) {
-    int poll_count = poll(fds->values, fds->len, -1);
-    if (poll_count < 0) {
-      perror("poll");
-      exit(EXIT_FAILURE);
-    }
-
-    for (int i = 0; i < fds->len; i++) {
-      if (fds->values[i].revents & POLLIN) {
-        if (fds->values[i].fd == listener) {
-          accept_connection(listener, fds);
-
-          continue;
-        }
-
-        int sender_fd = fds->values[i].fd;
-        int num_bytes = recv(sender_fd, buf, sizeof(buf), 0);
-
-        if (num_bytes <= 0) {
-          if (num_bytes == 0) {
-            printf("Load balancer: socket %d hung up\n", sender_fd);
-          } else {
-            perror("Could not receive data from client");
-          }
-
-          close(sender_fd);
-          remove_pfd(fds, i);
-
-          continue;
-        }
-
-        int upstream = upstream_sockfds[current_request % NUM_UPSTREAMS];
-        current_request++;
-
-        int bytes_sent = send(upstream, buf, num_bytes, 0);
-        if (bytes_sent < 0) {
-          perror("send");
-        }
-
-        char res_buf[4096];
-        num_bytes = recv(upstream, res_buf, 4096, 0);
-        if (bytes_sent < 0) {
-          perror("recv");
-        }
-
-        bytes_sent = send(sender_fd, res_buf, num_bytes, 0);
-        if (bytes_sent < 0) {
-          perror("send back");
-        }
-      }
-    }
-  }
 }
 
 int get_upstream_socket(const char *hostname, const char *port) {
@@ -211,7 +127,7 @@ int get_upstream_socket(const char *hostname, const char *port) {
   }
 
   if (p == NULL) {
-    fprintf(stderr, "Failed to connect\n");
+    fprintf(stderr, "Failed to connect to upstream\n");
     exit(EXIT_FAILURE);
   }
 
@@ -222,25 +138,139 @@ int get_upstream_socket(const char *hostname, const char *port) {
   return sockfd;
 }
 
-int main() {
-  char *error_msg;
+void connection_on_close_event(epoll_handler_t *handler) {
+  epoll_remove_handler(handler);
 
+  close(handler->fd);
+  if (handler->data) {
+    free(handler->data);
+    handler->data = NULL;
+    free(handler);
+  }
+}
+
+void write_to_fd(int sockfd, char *buffer, size_t buflen) {}
+
+void connection_on_in_event(epoll_handler_t *handler) {
+  client_data_t *data = (client_data_t *)handler->data;
+  size_t bytes_recvd = 0;
+  ssize_t nb = 0;
+
+  while (true) {
+    nb = recv(handler->fd, data->buf + bytes_recvd, BUFFSIZE - bytes_recvd, 0);
+    if (nb <= 0) {
+      if (nb == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return;
+      }
+
+      break;
+    }
+
+    bytes_recvd += nb;
+
+    if (send(data->opposing->fd, data->buf, bytes_recvd, 0) < 0) {
+      if (errno == ECONNRESET || errno == EPIPE) {
+        connection_on_close_event(data->opposing);
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return;
+      }
+
+      perror("Could not send data to opposing socket");
+    }
+  }
+}
+
+void connection_on_out_event(epoll_handler_t *handler) {}
+
+void connection_handle_event(epoll_handler_t *handler, uint32_t events) {
+  if (events & EPOLLIN) {
+    connection_on_in_event(handler);
+  }
+
+  if (events & EPOLLOUT) {
+    connection_on_out_event(handler);
+  }
+
+  if ((events & EPOLLERR) | (events & EPOLLHUP) | (events & EPOLLRDHUP)) {
+    connection_on_close_event(handler);
+  }
+}
+
+epoll_handler_t *create_connection(int client_fd) {
+  set_non_blocking(client_fd);
+
+  client_data_t *data = malloc(sizeof(client_data_t));
+  assert(data);
+  memset(data, 0, sizeof(*data));
+
+  epoll_handler_t *result = malloc(sizeof(epoll_handler_t));
+  result->fd = client_fd;
+  result->data = data;
+  result->handle = connection_handle_event;
+
+  epoll_add_handler(result, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET);
+
+  return result;
+}
+
+void handle_client_upstream_connection(int client_fd, char *upstream_port) {
+  epoll_handler_t *client_connection = create_connection(client_fd);
+  int upstream_fd = get_upstream_socket("localhost", upstream_port);
+
+  epoll_handler_t *upstream_connection = create_connection(upstream_fd);
+
+  ((client_data_t *)client_connection->data)->opposing = upstream_connection;
+  ((client_data_t *)upstream_connection->data)->opposing = client_connection;
+}
+
+void accept_connection(epoll_handler_t *self, uint32_t events) {
+  struct sockaddr_storage remoteaddr;
+  socklen_t addrlen = sizeof(remoteaddr);
+  int *connection_count = (int *)self->data;
+
+  int listener = self->fd;
+  int client_fd;
+
+  while (true) {
+    int client_fd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);
+    if (client_fd < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+      }
+      perror("Could not accept incoming connection");
+    }
+
+    printf("connection count: %d\n", *connection_count);
+    handle_client_upstream_connection(
+        client_fd, upstream_ports[++*connection_count % NUM_UPSTREAMS]);
+  }
+}
+
+void create_server_listener(char *server_port) {
+  char *error_msg;
   int listener = get_listener_socket();
   if (listener < 0) {
-    return 1;
+    exit(EXIT_FAILURE);
   }
 
-  char *upstream_ports[] = {"3000", "3001"};
-  da_fds fds = {0};
-  da_fds *pfds = &fds;
-  da_init(pfds, sizeof(struct pollfd));
-  add_pfd(pfds, listener);
+  epoll_handler_t *handler = malloc(sizeof(epoll_handler_t));
+  handler->fd = listener;
+  handler->handle = accept_connection;
+  handler->data = malloc(sizeof(int));
+  *(int *)handler->data = 0;
 
-  int upstream_sockfds[NUM_UPSTREAMS] = {0};
-  for (int i = 0; i < NUM_UPSTREAMS; i++) {
-    upstream_sockfds[i] = get_upstream_socket("localhost", upstream_ports[i]);
-  }
+  epoll_add_handler(handler, EPOLLIN | EPOLLET);
+}
 
-  recv_and_redirect(pfds, listener, upstream_sockfds);
+int main() {
+  signal(SIGPIPE, SIG_IGN);
+
+  epoll_init();
+  create_server_listener(PORT);
+
+  printf("Load balancer started, listening on port %s\n", PORT);
+
+  do_epoll_loop();
   return 0;
 }
