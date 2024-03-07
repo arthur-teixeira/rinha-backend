@@ -13,6 +13,7 @@
 #define PORT "9999"
 #define PORT_NUM 9999
 #define BACKLOG 10
+#define NUM_UPSTREAMS 2
 
 #define da_init(da, size)                                                      \
   do {                                                                         \
@@ -29,6 +30,9 @@
     }                                                                          \
     da->values[da->len++] = value;                                             \
   } while (0)
+
+int interrupt_flag = 0;
+size_t current_request = 0;
 
 typedef struct da_fds {
   size_t cap;
@@ -53,6 +57,9 @@ int get_listener_socket(void) {
     perror("Could not open socket");
     return -1;
   }
+
+  int optval = 1;
+  setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
   if (bind(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
     perror("Could not bind to address");
@@ -113,16 +120,10 @@ void accept_connection(int listener, da_fds *fds) {
   }
 
   add_pfd(fds, newfd);
-
-  char remote_ip[INET6_ADDRSTRLEN];
-  printf("Load balancer: new connection from [%s] on socket %d\n",
-         inet_ntop(remoteaddr.ss_family,
-                   get_in_addr((struct sockaddr *)&remoteaddr), remote_ip,
-                   INET6_ADDRSTRLEN),
-         newfd);
 }
 
-void recv_and_redirect(da_fds *fds, int listener) {
+void recv_and_redirect(da_fds *fds, int listener,
+                       int upstream_sockfds[NUM_UPSTREAMS]) {
   char buf[4096];
 
   for (;;) {
@@ -156,7 +157,24 @@ void recv_and_redirect(da_fds *fds, int listener) {
           continue;
         }
 
-        broadcast(fds, listener, sender_fd, num_bytes, buf);
+        int upstream = upstream_sockfds[current_request % NUM_UPSTREAMS];
+        current_request++;
+
+        int bytes_sent = send(upstream, buf, num_bytes, 0);
+        if (bytes_sent < 0) {
+          perror("send");
+        }
+
+        char res_buf[4096];
+        num_bytes = recv(upstream, res_buf, 4096, 0);
+        if (bytes_sent < 0) {
+          perror("recv");
+        }
+
+        bytes_sent = send(sender_fd, res_buf, num_bytes, 0);
+        if (bytes_sent < 0) {
+          perror("send back");
+        }
       }
     }
   }
@@ -189,7 +207,7 @@ int get_upstream_socket(const char *hostname, const char *port) {
       continue;
     }
 
-    break; // Successfully connected
+    break;
   }
 
   if (p == NULL) {
@@ -218,11 +236,11 @@ int main() {
   da_init(pfds, sizeof(struct pollfd));
   add_pfd(pfds, listener);
 
-  for (int i = 0; i < 2; i++) {
-    add_pfd(pfds, get_upstream_socket("localhost", upstream_ports[i]));
+  int upstream_sockfds[NUM_UPSTREAMS] = {0};
+  for (int i = 0; i < NUM_UPSTREAMS; i++) {
+    upstream_sockfds[i] = get_upstream_socket("localhost", upstream_ports[i]);
   }
 
-  recv_and_redirect(pfds, listener);
-
+  recv_and_redirect(pfds, listener, upstream_sockfds);
   return 0;
 }
