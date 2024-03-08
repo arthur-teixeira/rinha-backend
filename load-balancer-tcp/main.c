@@ -1,5 +1,4 @@
 #include <arpa/inet.h>
-#include <asm-generic/errno.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -20,8 +19,15 @@
 #define NUM_UPSTREAMS 2
 #define BUFFSIZE 4096
 
+size_t num_open_fds = 0;
+
+char *upstream_ports[] = {"3000", "3001"};
+struct addrinfo *upstream_addrinfo[NUM_UPSTREAMS] = {0};
+
 typedef struct epoll_handler_t {
   int fd;
+  void (*handle)(struct epoll_handler_t *, uint32_t);
+  bool is_upstream;
   struct epoll_handler_t *opposing;
   union {
     uint8_t request_count;
@@ -29,8 +35,14 @@ typedef struct epoll_handler_t {
   } data;
 } epoll_handler_t;
 
-char *upstream_ports[] = {"3000", "3001"};
 int epollfd;
+void epoll_init() {
+  epollfd = epoll_create1(0);
+  if (epollfd < 0) {
+    perror("epoll_create1");
+    exit(EXIT_FAILURE);
+  }
+}
 
 void epoll_add_handler(epoll_handler_t *handler, uint32_t events) {
   struct epoll_event ev;
@@ -40,6 +52,26 @@ void epoll_add_handler(epoll_handler_t *handler, uint32_t events) {
   if (epoll_ctl(epollfd, EPOLL_CTL_ADD, handler->fd, &ev) == -1) {
     perror("epoll_ctl: listen sock");
     exit(EXIT_FAILURE);
+  }
+}
+
+void epoll_remove_handler(epoll_handler_t *handler) {
+  epoll_ctl(epollfd, EPOLL_CTL_DEL, handler->fd, NULL);
+}
+
+void do_epoll_loop() {
+  char buf[4096];
+
+  for (;;) {
+    struct epoll_event current_event;
+
+    int nfds = epoll_wait(epollfd, &current_event, 1, -1);
+    if (nfds == -1) {
+      perror("Epoll_wait");
+      exit(EXIT_FAILURE);
+    }
+    epoll_handler_t *handler = current_event.data.ptr;
+    handler->handle(handler, current_event.events);
   }
 }
 
@@ -95,18 +127,26 @@ int get_listener_socket(void) {
   return sockfd;
 }
 
-int get_upstream_socket(const char *hostname, const char *port) {
-  struct addrinfo hints = {0};
-  struct addrinfo *server_info, *p;
+void *get_in_addr(struct sockaddr *sa) {
+  if (sa->sa_family == AF_INET) {
+    return &(((struct sockaddr_in *)sa)->sin_addr);
+  }
 
+  return &(((struct sockaddr_in6 *)sa)->sin6_addr);
+}
+
+void get_upstream_addrinfo(const char *hostname, const char *port, int i) {
+  struct addrinfo *server_info, *p;
+  struct addrinfo hints = {0};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
 
   int rv, sockfd;
-
   if ((rv = getaddrinfo(hostname, port, &hints, &server_info)) != 0) {
     fprintf(stderr, "Could not resolve address %s:%s :%s\n", hostname, port,
-            gai_strerror(rv));
+            rv != EAI_SYSTEM ? gai_strerror(rv) : strerror(errno));
+
     exit(EXIT_FAILURE);
   }
 
@@ -130,13 +170,32 @@ int get_upstream_socket(const char *hostname, const char *port) {
     exit(EXIT_FAILURE);
   }
 
-  freeaddrinfo(p);
+  close(sockfd);
+  upstream_addrinfo[i] = p;
+}
+
+int get_upstream_socket(int i) {
+  int sockfd;
+
+  struct addrinfo *p = upstream_addrinfo[i];
+
+  if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+    perror("socket");
+    exit(EXIT_FAILURE);
+  }
+
+  if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+    perror("connect");
+    close(sockfd);
+    exit(EXIT_FAILURE);
+  }
 
   return sockfd;
 }
 
 void connection_on_close_event(epoll_handler_t *handler) {
-  epoll_ctl(epollfd, EPOLL_CTL_DEL, handler->fd, NULL);
+  printf("Closed connection, %ld open\n", --num_open_fds);
+  epoll_remove_handler(handler);
   close(handler->fd);
   free(handler);
 }
@@ -146,15 +205,12 @@ void connection_on_in_event(epoll_handler_t *handler) {
   ssize_t nb = 0;
 
   while (true) {
-    nb = recv(handler->fd, handler->data.buf + bytes_recvd, BUFFSIZE - bytes_recvd, 0);
+    nb = recv(handler->fd, handler->data.buf + bytes_recvd,
+              BUFFSIZE - bytes_recvd, 0);
     if (nb <= 0) {
       // Já que o epoll está com a flat EPOLLET(edge triggered), só recebemos um
       // evento quando o fd estiver disponível para leitura Nesse caso, temos
       // que receber dados em um loop até receber EAGAIN ou EWOULDBLOCK
-      if (nb == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        return;
-      }
-
       break;
     }
 
@@ -164,8 +220,9 @@ void connection_on_in_event(epoll_handler_t *handler) {
       if (errno == ECONNRESET || errno == EPIPE) {
         connection_on_close_event(handler->opposing);
       }
-      // Nesse caso, o buffer do socket está cheio, e devemos esperar a kernel fazer o flush
-      // Não estou fazendo isso especificamente pq na rinha os requests nunca vão ser tão grandes a ponto de lotar o buffer
+      // Nesse caso, o buffer do socket está cheio, e devemos esperar a kernel
+      // fazer o flush Não estou fazendo isso especificamente pq na rinha os
+      // requests nunca vão ser tão grandes a ponto de lotar o buffer
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         return;
       }
@@ -173,38 +230,42 @@ void connection_on_in_event(epoll_handler_t *handler) {
       perror("Could not send data to opposing socket");
     }
   }
+
+  // Se recebemos do upstream, fechamos a conexão
+  // TODO: Pode impactar a performance. Manter a conexão com o upstream aberta
+  // e reutilizar em uma pool
+  if (handler->is_upstream) {
+    connection_on_close_event(handler->opposing);
+    connection_on_close_event(handler);
+  }
 }
 
 void connection_handle_event(epoll_handler_t *handler, uint32_t events) {
   if (events & EPOLLIN) {
     connection_on_in_event(handler);
   }
-
-  if ((events & EPOLLERR) | (events & EPOLLHUP) | (events & EPOLLRDHUP)) {
-    connection_on_close_event(handler);
-    if (handler->opposing) {
-      connection_on_close_event(handler->opposing);
-    }
-  }
 }
 
-epoll_handler_t *create_connection(int client_fd) {
+epoll_handler_t *create_connection(int client_fd, bool is_upstream) {
   set_non_blocking(client_fd);
 
   epoll_handler_t *result = malloc(sizeof(epoll_handler_t));
   result->fd = client_fd;
   memset(result->data.buf, 0, BUFFSIZE);
+  result->handle = connection_handle_event;
+  result->is_upstream = is_upstream;
 
-  epoll_add_handler(result, EPOLLIN | EPOLLRDHUP | EPOLLET);
+  epoll_add_handler(result, EPOLLIN | EPOLLET);
 
   return result;
 }
 
-void handle_client_upstream_connection(int client_fd, char *upstream_port) {
-  epoll_handler_t *client_connection = create_connection(client_fd);
-  int upstream_fd = get_upstream_socket("localhost", upstream_port);
+void handle_client_upstream_connection(int client_fd, int upstream_num) {
+  epoll_handler_t *client_connection = create_connection(client_fd, false);
+  int upstream_fd = get_upstream_socket(upstream_num);
+  printf("Opened upstream connection, %ld open\n", ++num_open_fds);
 
-  epoll_handler_t *upstream_connection = create_connection(upstream_fd);
+  epoll_handler_t *upstream_connection = create_connection(upstream_fd, true);
 
   client_connection->opposing = upstream_connection;
   upstream_connection->opposing = client_connection;
@@ -225,13 +286,14 @@ void accept_connection(epoll_handler_t *self, uint32_t events) {
       }
       perror("Could not accept incoming connection");
     }
+    printf("Opened upstream connection, %ld open\n", ++num_open_fds);
 
-    handle_client_upstream_connection(
-        client_fd, upstream_ports[++self->data.request_count % NUM_UPSTREAMS]);
+    handle_client_upstream_connection(client_fd,
+                                      self->data.request_count % NUM_UPSTREAMS);
   }
 }
 
-int create_server_listener(char *server_port) {
+void create_server_listener(char *server_port) {
   char *error_msg;
   int listener = get_listener_socket();
   if (listener < 0) {
@@ -240,40 +302,24 @@ int create_server_listener(char *server_port) {
 
   epoll_handler_t *handler = malloc(sizeof(epoll_handler_t));
   handler->fd = listener;
+  handler->handle = accept_connection;
   handler->data.request_count = 0;
 
   epoll_add_handler(handler, EPOLLIN | EPOLLET);
-
-  return listener;
 }
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
 
-  epollfd = epoll_create1(0);
-  if (epollfd < 0) {
-    perror("epoll_create1");
-    exit(EXIT_FAILURE);
+  for (int i = 0; i < NUM_UPSTREAMS; i++) {
+    get_upstream_addrinfo("localhost", upstream_ports[i], i);
   }
 
-  int listener_fd = create_server_listener(PORT);
+  epoll_init();
+  create_server_listener(PORT);
 
   printf("Load balancer started, listening on port %s\n", PORT);
-  for (;;) {
-    struct epoll_event current_event;
 
-    int nfds = epoll_wait(epollfd, &current_event, 1, -1);
-    if (nfds == -1) {
-      perror("Epoll_wait");
-      exit(EXIT_FAILURE);
-    }
-    epoll_handler_t *handler = current_event.data.ptr;
-    if (handler->fd == listener_fd) {
-      accept_connection(handler, current_event.events);
-    } else {
-      connection_handle_event(handler, current_event.events);
-    }
-  }
-
+  do_epoll_loop();
   return 0;
 }
