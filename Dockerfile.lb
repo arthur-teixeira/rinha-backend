@@ -6,7 +6,7 @@ RUN apk add --no-cache build-base
 
 COPY /load-balancer-tcp /app
 
-RUN gcc -O3 -o load-balancer-tcp /app/main.c
+RUN gcc -Ofast -o load-balancer-tcp /app/main.c
 
 FROM alpine:latest
 

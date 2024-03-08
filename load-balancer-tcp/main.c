@@ -19,8 +19,6 @@
 #define NUM_UPSTREAMS 2
 #define BUFFSIZE 4096
 
-size_t num_open_fds = 0;
-
 char *upstream_ports[] = {"3000", "3001"};
 struct addrinfo *upstream_addrinfo[NUM_UPSTREAMS] = {0};
 
@@ -194,7 +192,6 @@ int get_upstream_socket(int i) {
 }
 
 void connection_on_close_event(epoll_handler_t *handler) {
-  printf("Closed connection, %ld open\n", --num_open_fds);
   epoll_remove_handler(handler);
   close(handler->fd);
   free(handler);
@@ -263,7 +260,6 @@ epoll_handler_t *create_connection(int client_fd, bool is_upstream) {
 void handle_client_upstream_connection(int client_fd, int upstream_num) {
   epoll_handler_t *client_connection = create_connection(client_fd, false);
   int upstream_fd = get_upstream_socket(upstream_num);
-  printf("Opened upstream connection, %ld open\n", ++num_open_fds);
 
   epoll_handler_t *upstream_connection = create_connection(upstream_fd, true);
 
@@ -286,7 +282,6 @@ void accept_connection(epoll_handler_t *self, uint32_t events) {
       }
       perror("Could not accept incoming connection");
     }
-    printf("Opened upstream connection, %ld open\n", ++num_open_fds);
 
     handle_client_upstream_connection(client_fd,
                                       self->data.request_count % NUM_UPSTREAMS);
