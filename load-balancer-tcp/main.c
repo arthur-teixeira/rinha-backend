@@ -15,14 +15,33 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "epoll_layer.h"
-
 #define PORT "9999"
 #define BACKLOG 10
 #define NUM_UPSTREAMS 2
 #define BUFFSIZE 4096
 
+typedef struct epoll_handler_t {
+  int fd;
+  struct epoll_handler_t *opposing;
+  union {
+    uint8_t request_count;
+    char buf[BUFFSIZE];
+  } data;
+} epoll_handler_t;
+
 char *upstream_ports[] = {"3000", "3001"};
+int epollfd;
+
+void epoll_add_handler(epoll_handler_t *handler, uint32_t events) {
+  struct epoll_event ev;
+  ev.data.ptr = handler;
+  ev.events = events;
+
+  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, handler->fd, &ev) == -1) {
+    perror("epoll_ctl: listen sock");
+    exit(EXIT_FAILURE);
+  }
+}
 
 void set_non_blocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -76,20 +95,6 @@ int get_listener_socket(void) {
   return sockfd;
 }
 
-void remove_pfd(int epollfd, int fd, struct epoll_event *ev) {
-  if (epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, ev) == -1) {
-    perror("epoll del");
-  }
-}
-
-void *get_in_addr(struct sockaddr *sa) {
-  if (sa->sa_family == AF_INET) {
-    return &(((struct sockaddr_in *)sa)->sin_addr);
-  }
-
-  return &(((struct sockaddr_in6 *)sa)->sin6_addr);
-}
-
 int get_upstream_socket(const char *hostname, const char *port) {
   struct addrinfo hints = {0};
   struct addrinfo *server_info, *p;
@@ -131,7 +136,7 @@ int get_upstream_socket(const char *hostname, const char *port) {
 }
 
 void connection_on_close_event(epoll_handler_t *handler) {
-  epoll_remove_handler(handler);
+  epoll_ctl(epollfd, EPOLL_CTL_DEL, handler->fd, NULL);
   close(handler->fd);
   free(handler);
 }
@@ -189,7 +194,6 @@ epoll_handler_t *create_connection(int client_fd) {
   epoll_handler_t *result = malloc(sizeof(epoll_handler_t));
   result->fd = client_fd;
   memset(result->data.buf, 0, BUFFSIZE);
-  result->handle = connection_handle_event;
 
   epoll_add_handler(result, EPOLLIN | EPOLLRDHUP | EPOLLET);
 
@@ -227,7 +231,7 @@ void accept_connection(epoll_handler_t *self, uint32_t events) {
   }
 }
 
-void create_server_listener(char *server_port) {
+int create_server_listener(char *server_port) {
   char *error_msg;
   int listener = get_listener_socket();
   if (listener < 0) {
@@ -236,20 +240,40 @@ void create_server_listener(char *server_port) {
 
   epoll_handler_t *handler = malloc(sizeof(epoll_handler_t));
   handler->fd = listener;
-  handler->handle = accept_connection;
   handler->data.request_count = 0;
 
   epoll_add_handler(handler, EPOLLIN | EPOLLET);
+
+  return listener;
 }
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
 
-  epoll_init();
-  create_server_listener(PORT);
+  epollfd = epoll_create1(0);
+  if (epollfd < 0) {
+    perror("epoll_create1");
+    exit(EXIT_FAILURE);
+  }
+
+  int listener_fd = create_server_listener(PORT);
 
   printf("Load balancer started, listening on port %s\n", PORT);
+  for (;;) {
+    struct epoll_event current_event;
 
-  do_epoll_loop();
+    int nfds = epoll_wait(epollfd, &current_event, 1, -1);
+    if (nfds == -1) {
+      perror("Epoll_wait");
+      exit(EXIT_FAILURE);
+    }
+    epoll_handler_t *handler = current_event.data.ptr;
+    if (handler->fd == listener_fd) {
+      accept_connection(handler, current_event.events);
+    } else {
+      connection_handle_event(handler, current_event.events);
+    }
+  }
+
   return 0;
 }
