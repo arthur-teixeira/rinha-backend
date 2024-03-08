@@ -1,0 +1,17 @@
+FROM alpine:latest as builder
+
+WORKDIR /app
+
+RUN apk add --no-cache build-base
+
+COPY /load-balancer-tcp /app
+
+RUN gcc -O3 -o load-balancer-tcp /app/main.c
+
+FROM alpine:latest
+
+COPY --from=builder /app/load-balancer-tcp /app/load-balancer-tcp
+
+WORKDIR /app
+
+CMD ["/app/load-balancer-tcp"]
