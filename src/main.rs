@@ -11,8 +11,7 @@ use axum::{
 use serde::{self, Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Postgres;
-use sqlx::{postgres::PgPoolOptions, Pool};
-use std::collections::VecDeque;
+use sqlx::{postgres::PgPoolOptions, query, Pool, Row};
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::RwLock;
@@ -43,65 +42,43 @@ impl TryFrom<String> for Description {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Transaction {
-    valor: isize,
+    valor: i32,
     tipo: TransactionType,
     descricao: Description,
     #[serde(with = "time::serde::rfc3339", default = "OffsetDateTime::now_utc")]
     realizada_em: OffsetDateTime,
 }
 
-#[derive(Clone, Serialize)]
-struct RingBuffer<T> {
-    buf: VecDeque<T>,
-}
-
-impl<T> Default for RingBuffer<T> {
-    fn default() -> Self {
-        RingBuffer::with_capacity(10)
-    }
-}
-
-impl<T> RingBuffer<T> {
-    fn with_capacity(cap: usize) -> Self {
-        RingBuffer {
-            buf: VecDeque::with_capacity(cap),
-        }
-    }
-
-    pub fn push(&mut self, item: T) {
-        if self.buf.len() == self.buf.capacity() {
-            self.buf.pop_back();
-            self.buf.push_front(item);
-        } else {
-            self.buf.push_front(item);
-        }
-    }
-}
-
 struct Account {
-    balance: isize,
-    limit: isize,
-    transactions: RingBuffer<Transaction>,
+    limit: i32,
+    id: i32,
+}
+
+#[derive(Serialize)]
+struct TransactionResult {
+    saldo: i32,
+    limite: i32,
 }
 
 impl Account {
-    fn new(limit: isize) -> Self {
+    fn new(limit: i32, id: i32) -> Self {
         Account {
-            balance: 0,
             limit,
-            transactions: RingBuffer::default(),
+            id
         }
     }
 
-    async fn do_transaction(&mut self, t: Transaction, db: &Pool<Postgres>) -> Result<(), &str> {
+    async fn do_transaction(&mut self, t: Transaction, db: &Pool<Postgres>) -> Result<TransactionResult, &str> {
+        let balance = self.balance(db).await.unwrap() as i32;
+
         let bal = match t.tipo {
-            TransactionType::Credit => t.valor + self.balance,
+            TransactionType::Credit => t.valor + balance,
             TransactionType::Debit => {
-                if self.limit + self.balance < t.valor {
+                if self.limit + balance < t.valor {
                     return Err("O valor ultrapassa o limite da conta");
                 }
 
-                self.balance - t.valor
+                balance - t.valor
             }
         };
 
@@ -127,35 +104,56 @@ impl Account {
             Err(_) => return Err("Erro ao inserir transação"),
         }
 
-        self.balance = bal;
-        self.transactions.push(t);
-
         match tx.commit().await {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(TransactionResult {
+                saldo: bal,
+                limite: self.limit,
+            }),
             Err(_) => Err("Erro ao finalizar transação"),
         }
     }
 
     async fn transactions(&self, id: i16, db: &Pool<Postgres>) -> Result<Vec<Transaction>, &str> {
-        let mut tx = match db.begin().await {
-            Ok(tx) => tx,
-            Err(_) => return Err("Erro ao iniciar transação"),
-        };
-
-        let rows = match sqlx::query("SELECT valor, descricao, tipo, realizada_em FROM transacoes WHERE cliente_id = ($1) ORDER BY realizada_em DESC LIMIT 10")
+        let rows = match query("SELECT valor, descricao, tipo, realizada_em FROM transacoes WHERE cliente_id = ($1) ORDER BY realizada_em DESC LIMIT 10")
             .bind(id)
-            .fetch_all(&mut *tx)
+            .fetch_all(db)
             .await
             {
                 Ok(rows) => rows,
                 Err(_) => return Err("Erro ao buscar transações"),
             };
 
-        let mut transactions = Vec::with_capacity(10);
-        for row in rows {
-        }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                Ok(Transaction {
+                    valor: row.get("valor"),
+                    descricao: Description(row.get("descricao")),
+                    tipo: match row.get("tipo") {
+                        "c" => TransactionType::Credit,
+                        "d" => TransactionType::Debit,
+                        _ => return Err("Tipo de transação inválido"),
+                    },
+                    realizada_em: row.get("realizada_em"),
+                })
+            })
+            .collect::<Result<Vec<Transaction>, &str>>()?)
+    }
 
-        Err("Not implemented")
+    async fn balance(&self, db: &Pool<Postgres>) -> Result<i64, &str> {
+        let row = match query("SELECT SUM(CASE WHEN tipo = 'd' THEN -valor ELSE valor END) as saldo FROM transacoes WHERE cliente_id = $1")
+            .bind(self.id)
+            .fetch_one(db)
+            .await
+        {
+            Ok(row) => row,
+            Err(_) => return Err("Erro ao buscar saldo"),
+        };
+
+        match row.try_get("saldo") {
+            Ok(saldo) => Ok(saldo),
+            Err(_) => Ok(0),
+        }
     }
 }
 
@@ -182,11 +180,11 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let acc1 = Account::new(100_000);
-    let acc2 = Account::new(80_000);
-    let acc3 = Account::new(1_000_000);
-    let acc4 = Account::new(10_000_000);
-    let acc5 = Account::new(500_000);
+    let acc1 = Account::new(100_000, 1);
+    let acc2 = Account::new(80_000, 2);
+    let acc3 = Account::new(1_000_000, 3);
+    let acc4 = Account::new(10_000_000, 4);
+    let acc5 = Account::new(500_000, 5);
 
     let accounts = Accounts::from_iter([
         (1, RwLock::new(acc1)),
@@ -227,10 +225,7 @@ async fn create_transaction(
         Some(acc) => {
             let mut account = acc.write().await;
             match account.do_transaction(transaction, &app_state.db).await {
-                Ok(()) => Ok(Json(json!({
-                    "limite": account.limit,
-                    "saldo": account.balance,
-                }))),
+                Ok(result) => Ok(Json(json!(result))),
                 Err(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
             }
         }
@@ -245,14 +240,18 @@ async fn get_transactions(
     match app_state.accounts.get(&id) {
         Some(acc) => {
             let account = acc.read().await;
-            Ok(Json(json!({
-                "saldo": {
-                    "total": account.balance,
-                    "data_extrato": OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
-                    "limite": account.limit,
-                },
-                "ultimas_transacoes": account.transactions.buf,
-            })))
+            if let Ok(transactions) = account.transactions(id as i16, &app_state.db).await {
+                Ok(Json(json!({
+                    "saldo": {
+                        "total": account.balance(&app_state.db).await.unwrap(),
+                        "data_extrato": OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
+                        "limite": account.limit,
+                    },
+                    "ultimas_transacoes": transactions,
+                })))
+            } else {
+                Err(StatusCode::NOT_FOUND)
+            }
         }
         None => Err(StatusCode::NOT_FOUND),
     }
