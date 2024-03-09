@@ -4,23 +4,23 @@ services:
   api01: &api
     build: .
     hostname: api01
-    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - db
     environment:
       - PORT=3001
-    ports:
-      - "3001:3001"
+      - DATABASE_URL=postgres://rinha:rinha@localhost:5432/rinha?sslmode=disable
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          memory: "200MB"
+          cpus: "0.3"
+          memory: "125MB"
 
   api02:
     <<: *api
     environment:
       - PORT=3000
-    ports:
-      - "3000:3000"
+      - DATABASE_URL=postgres://rinha:rinha@localhost:5432/rinha?sslmode=disable
     hostname: api2
 
   load-balancer:
@@ -34,5 +34,25 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: "100MB"
+          cpus: "0.2"
+          memory: "50MB"
+
+  db:
+    image: postgres:latest
+    hostname: db
+    ports:
+      - "5432:5432"
+    network_mode: host
+    environment:
+      - POSTGRES_PASSWORD=rinha
+      - POSTGRES_USER=rinha
+      - POSTGRES_DB=rinha
+    volumes:
+      - ./db/postgresql.conf:/docker-entrypoint-initdb.d/postgresql.conf
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: [ "postgres", "-c", "config_file=/docker-entrypoint-initdb.d/postgresql.conf" ]
+    deploy:
+       resources:
+         limits:
+           cpus: "0.7"
+           memory: "250MB"

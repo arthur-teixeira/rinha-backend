@@ -284,7 +284,7 @@ void accept_connection(epoll_handler_t *self, uint32_t events) {
     }
 
     handle_client_upstream_connection(client_fd,
-                                      self->data.request_count % NUM_UPSTREAMS);
+                                      ++self->data.request_count % NUM_UPSTREAMS);
   }
 }
 

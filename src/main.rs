@@ -10,6 +10,8 @@ use axum::{
 };
 use serde::{self, Deserialize, Serialize};
 use serde_json::json;
+use sqlx::Postgres;
+use sqlx::{postgres::PgPoolOptions, Pool};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -91,7 +93,7 @@ impl Account {
         }
     }
 
-    fn do_transaction(&mut self, t: Transaction) -> Result<(), &str> {
+    async fn do_transaction(&mut self, t: Transaction, db: &Pool<Postgres>) -> Result<(), &str> {
         let bal = match t.tipo {
             TransactionType::Credit => t.valor + self.balance,
             TransactionType::Debit => {
@@ -103,16 +105,73 @@ impl Account {
             }
         };
 
-        self.balance = bal;
+        let mut tx = match db.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return Err("Erro ao iniciar transação"),
+        };
 
+        match sqlx::query(
+            "INSERT INTO transacoes (cliente_id, valor, descricao, tipo) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(1)
+        .bind(t.valor as i16)
+        .bind(t.descricao.0.clone())
+        .bind(match t.tipo {
+            TransactionType::Credit => "c",
+            TransactionType::Debit => "d",
+        })
+        .execute(&mut *tx)
+        .await
+        {
+            Ok(_) => (),
+            Err(_) => return Err("Erro ao inserir transação"),
+        }
+
+        self.balance = bal;
         self.transactions.push(t);
 
-        Ok(())
+        match tx.commit().await {
+            Ok(_) => Ok(()),
+            Err(_) => Err("Erro ao finalizar transação"),
+        }
+    }
+
+    async fn transactions(&self, id: i16, db: &Pool<Postgres>) -> Result<Vec<Transaction>, &str> {
+        let mut tx = match db.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return Err("Erro ao iniciar transação"),
+        };
+
+        let rows = match sqlx::query("SELECT valor, descricao, tipo, realizada_em FROM transacoes WHERE cliente_id = ($1) ORDER BY realizada_em DESC LIMIT 10")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return Err("Erro ao buscar transações"),
+            };
+
+        let mut transactions = Vec::with_capacity(10);
+        for row in rows {
+        }
+
+        Err("Not implemented")
     }
 }
 
 type Accounts = HashMap<u8, RwLock<Account>>;
-type AppState = Arc<Accounts>;
+
+struct AppState {
+    accounts: Accounts,
+    db: Pool<Postgres>,
+}
+
+impl AppState {
+    async fn new(accounts: Accounts) -> Self {
+        let db = connect_to_db().await;
+        AppState { accounts, db }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -136,11 +195,12 @@ async fn main() {
         (4, RwLock::new(acc4)),
         (5, RwLock::new(acc5)),
     ]);
+    let app_state = Arc::new(AppState::new(accounts).await);
 
     let app = Router::new()
         .route("/clientes/:id/transacoes", post(create_transaction))
         .route("/clientes/:id/extrato", get(get_transactions))
-        .with_state(Arc::new(accounts));
+        .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
@@ -149,15 +209,24 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+async fn connect_to_db() -> Pool<Postgres> {
+    let url = env::var("DATABASE_URL").expect("DATABASE_URL not found");
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .expect("Failed to connect to database")
+}
+
 async fn create_transaction(
     Path(id): Path<u8>,
-    State(accounts): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
     Json(transaction): Json<Transaction>,
 ) -> impl IntoResponse {
-    match accounts.get(&id) {
+    match app_state.accounts.get(&id) {
         Some(acc) => {
             let mut account = acc.write().await;
-            match account.do_transaction(transaction) {
+            match account.do_transaction(transaction, &app_state.db).await {
                 Ok(()) => Ok(Json(json!({
                     "limite": account.limit,
                     "saldo": account.balance,
@@ -171,9 +240,9 @@ async fn create_transaction(
 
 async fn get_transactions(
     Path(id): Path<u8>,
-    State(accounts): State<AppState>,
+    State(app_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match accounts.get(&id) {
+    match app_state.accounts.get(&id) {
         Some(acc) => {
             let account = acc.read().await;
             Ok(Json(json!({
