@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -25,14 +26,15 @@ type Account struct {
 	mu      sync.Mutex
 	Id      int8
 	Balance int32
+	Limit   int32
 	Db      *Database
 }
 
 type Database struct {
-	Capacity        int
-	File            *os.File
-	row             int
-	rowSize         int
+	Capacity int
+	File     *os.File
+	row      int
+	rowSize  int
 }
 
 func (d *Database) IncreaseRowCount() error {
@@ -61,10 +63,10 @@ func (d *Database) Insert(t Transaction) error {
 		return err
 	}
 
-	err = d.File.Sync()
-	if err != nil {
-		return err
-	}
+	// err = d.File.Sync()
+	// if err != nil {
+	// 	return err
+	// }
 
 	return d.IncreaseRowCount()
 }
@@ -138,6 +140,10 @@ func (a *Account) PerformTransaction(t Transaction) error {
 		a.Balance += t.Valor
 	} else {
 		a.Balance -= t.Valor
+		if a.Balance < -a.Limit {
+			a.Balance += t.Valor
+			return errors.New("ENOBALANCE")
+		}
 	}
 
 	return a.Db.Insert(t)
@@ -151,21 +157,26 @@ func (a *Account) GetTransactions() (*[]Transaction, error) {
 
 }
 
-func InitAccount(id int8) *Account {
+func InitAccount(id int8, limit int32) *Account {
 	db := InitDatabase(fmt.Sprintf("./account_%d.rinha", id), 10, ROW_SIZE)
 
-	return &Account{Id: id, Db: db, Balance: 0}
+	return &Account{
+		Id:      id,
+		Db:      db,
+		Balance: 0,
+		Limit:   limit,
+	}
 }
 
 func main() {
 	fmt.Println("Starting server...")
 
 	accounts := make(map[int8]*Account)
-	accounts[1] = InitAccount(1)
-	accounts[2] = InitAccount(2)
-	accounts[3] = InitAccount(3)
-	accounts[4] = InitAccount(4)
-	accounts[5] = InitAccount(5)
+	accounts[1] = InitAccount(1, 100_000)
+	accounts[2] = InitAccount(2, 80_000)
+	accounts[3] = InitAccount(3, 1_000_000)
+	accounts[4] = InitAccount(4, 10_000_000)
+	accounts[5] = InitAccount(5, 500_000)
 
 	listener, err := net.Listen("tcp", "localhost:8080")
 	if err != nil {
@@ -260,7 +271,18 @@ func insertTransaction(conn net.Conn, buf []byte, account *Account) error {
 		RealizadaEm: time.Now().Unix(),
 	}
 
+	success := 0
+
 	err := account.PerformTransaction(transaction)
+	if err != nil {
+		if err.Error() == "ENOBALANCE" {
+			success = 1
+		} else {
+			return err
+		}
+	}
+
+	err = binary.Write(conn, binary.BigEndian, int8(success))
 	if err != nil {
 		return err
 	}

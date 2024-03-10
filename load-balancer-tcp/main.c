@@ -285,8 +285,6 @@ void create_server_listener(char *server_port) {
 }
 
 int main() {
-  sleep(5); // Gambiarra pq o rinha demora pra subir
-
   signal(SIGPIPE, SIG_IGN);
 
   for (int i = 0; i < NUM_UPSTREAMS; i++) {

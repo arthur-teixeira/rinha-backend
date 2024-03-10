@@ -11,8 +11,8 @@ pub struct Connection {
 pub const TRANSACTION_ROW_SIZE: usize = 23;
 
 impl Connection {
-    pub async fn connect(_port: String) -> io::Result<Self> {
-        let addr = "127.0.0.1:8080";
+    pub async fn connect(port: String) -> io::Result<Self> {
+        let addr = format!("127.0.0.1:{}", port);
 
         let stream = TcpStream::connect(addr).await?;
         Ok(Connection { stream })
@@ -36,25 +36,17 @@ impl Connection {
         self.stream.write_all(&buf).await?;
         self.stream.flush().await?;
 
-        let mut response = vec![0u8; 4];
+        self.stream.readable().await?;
+        let success = self.stream.read_u8().await?;
 
-        loop {
-            self.stream.readable().await?;
-            match self.stream.try_read(&mut response) {
-                Ok(_) => break,
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        continue;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
+        self.stream.readable().await?;
+        let balance = self.stream.read_i32().await?;
+
+        if success == 1 {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "Transação inválida"))
+        } else {
+            Ok(balance)
         }
-
-        let mut balance = [0u8; 4];
-        balance.copy_from_slice(&response[0..4]);
-        Ok(i32::from_be_bytes(balance))
     }
 
     pub async fn get_transactions(&mut self, account_id: i32) -> io::Result<AccountExtract> {
@@ -70,11 +62,17 @@ impl Connection {
         self.stream.readable().await?;
         let balance = self.stream.read_i32().await?;
 
+        if response_size == 0 {
+            return Ok(AccountExtract {
+                transactions: Vec::new(),
+                balance,
+            });
+        }
+
         let mut response = Vec::with_capacity(response_size as usize);
 
         loop {
             self.stream.readable().await?;
-
             match self.stream.read_buf(&mut response).await {
                 Ok(_) => break,
                 Err(e) => {

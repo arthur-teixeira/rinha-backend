@@ -38,21 +38,12 @@ services:
           memory: "100MB"
 
   db:
-    image: postgres:latest
-    hostname: db
-    ports:
-      - "5432:5432"
+    build:
+      context: .
+      dockerfile: Dockerfile.db
     network_mode: host
-    environment:
-      - POSTGRES_PASSWORD=rinha
-      - POSTGRES_USER=rinha
-      - POSTGRES_DB=rinha
-    volumes:
-      - ./db/postgresql.conf:/docker-entrypoint-initdb.d/postgresql.conf
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
-    command: [ "postgres", "-c", "config_file=/docker-entrypoint-initdb.d/postgresql.conf" ]
     deploy:
-       resources:
-         limits:
-           cpus: "1"
-           memory: "250MB"
+      resources:
+        limits:
+          cpus: "1"
+          memory: "250MB"

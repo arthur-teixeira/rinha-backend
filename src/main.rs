@@ -15,6 +15,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::RwLock;
 
 mod db;
+mod pool;
 
 #[derive(Clone, Serialize, Deserialize)]
 enum TransactionType {
@@ -117,45 +118,44 @@ impl Account {
         Account { limit, id }
     }
 
-    async fn do_transaction(&mut self, t: Transaction) -> Result<TransactionResult, &str> {
-        let mut db = match db::Connection::connect("8080".into()).await {
-            Ok(db) => db,
-            Err(e) => {
-                eprintln!("{:?}", e);
-                return Err("Erro ao conectar com o banco de pobre");
-            }
+    async fn do_transaction(
+        &mut self,
+        t: Transaction,
+        db: &pool::Pool,
+    ) -> Result<TransactionResult, String> {
+        let mut conn = match db.get().await {
+            Ok(conn) => conn,
+            Err(_) => return Err("Erro ao buscar conexão no pool".to_string()),
         };
 
-        let new_bal = match db.insert_transaction(&t, self.id).await {
+        let new_bal = match conn.insert_transaction(&t, self.id).await {
             Ok(bal) => bal,
             Err(e) => {
-                eprintln!("{:?}", e);
-                return Err("Erro ao inserir transação no banco de pobre");
+                let msg = format!("Erro ao inserir transação no banco: {e}");
+                return Err(msg);
             }
         };
 
-        Ok(TransactionResult {
+        let result = TransactionResult {
             saldo: new_bal,
             limite: self.limit,
-        })
-    }
-
-    async fn transactions(&self) -> Result<AccountExtract, &str> {
-        let mut pobre_db = match db::Connection::connect("8080".into()).await {
-            Ok(db) => db,
-            Err(e) => {
-                eprintln!("{:?}", e);
-                return Err("Erro ao conectar com o banco de pobre");
-            }
         };
 
-        match pobre_db.get_transactions(self.id).await {
+        Ok(result)
+    }
+
+    async fn transactions(&self, db: &pool::Pool) -> Result<AccountExtract, &str> {
+        let mut conn = match db.get().await {
+            Ok(conn) => conn,
+            Err(_) => return Err("Erro ao buscar conexão no pool"),
+        };
+
+        let result = match conn.get_transactions(self.id).await {
             Ok(result) => Ok(result),
-            Err(e) => {
-                eprintln!("{:?}", e);
-                return Err("Erro ao buscar transações no banco de pobre");
-            }
-        }
+            Err(_) => return Err("Erro ao buscar transações no banco"),
+        };
+
+        result
     }
 }
 
@@ -163,11 +163,14 @@ type Accounts = HashMap<u8, RwLock<Account>>;
 
 struct AppState {
     accounts: Accounts,
+    db: pool::Pool,
 }
 
 impl AppState {
     async fn new(accounts: Accounts) -> Self {
-        AppState { accounts }
+        let manager = pool::ConnectionPool {};
+        let db = pool::Pool::builder(manager).build().unwrap();
+        AppState { accounts, db }
     }
 }
 
@@ -215,7 +218,7 @@ async fn create_transaction(
     match app_state.accounts.get(&id) {
         Some(acc) => {
             let mut account = acc.write().await;
-            match account.do_transaction(transaction).await {
+            match account.do_transaction(transaction, &app_state.db).await {
                 Ok(result) => Ok(Json(json!(result))),
                 Err(e) => {
                     println!("{e}");
@@ -234,14 +237,14 @@ async fn get_transactions(
     match app_state.accounts.get(&id) {
         Some(acc) => {
             let account = acc.read().await;
-            if let Ok(transactions) = account.transactions().await {
+            if let Ok(result) = account.transactions(&app_state.db).await {
                 Ok(Json(json!({
                     "saldo": {
-                        "total": transactions.balance,
+                        "total": result.balance,
                         "data_extrato": OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
                         "limite": account.limit,
                     },
-                    "ultimas_transacoes": transactions.transactions,
+                    "ultimas_transacoes": result.transactions,
                 })))
             } else {
                 Err(StatusCode::NOT_FOUND)
