@@ -10,11 +10,11 @@ use axum::{
 };
 use serde::{self, Deserialize, Serialize};
 use serde_json::json;
-use sqlx::Postgres;
-use sqlx::{postgres::PgPoolOptions, query, Pool, Row};
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::RwLock;
+
+mod db;
 
 #[derive(Clone, Serialize, Deserialize)]
 enum TransactionType {
@@ -49,6 +49,53 @@ struct Transaction {
     realizada_em: OffsetDateTime,
 }
 
+impl Transaction {
+    fn from_binary_array(data: Vec<u8>) -> Result<Vec<Self>, &'static str> {
+        let amount = data.len() / db::TRANSACTION_ROW_SIZE;
+
+        let mut result = Vec::with_capacity(amount);
+        for i in 0..amount {
+            let start = i * db::TRANSACTION_ROW_SIZE;
+            let end = start + db::TRANSACTION_ROW_SIZE;
+            let row = &data[start..end];
+
+            result.push(Self::from_binary(row)?);
+        }
+
+        Ok(result)
+    }
+
+    fn from_binary(data: &[u8]) -> Result<Self, &'static str> {
+        let mut valor_buf = [0u8; 4];
+        valor_buf.copy_from_slice(&data[0..4]);
+        let valor = i32::from_be_bytes(valor_buf);
+
+        let mut descricao = Vec::with_capacity(10);
+        descricao.extend_from_slice(&data[4..14]);
+        descricao.retain(|&x| x != 0);
+
+        let tipo = data[14];
+
+        let mut realizada_em_buf = [0u8; 8];
+        realizada_em_buf.copy_from_slice(&data[15..23]);
+        let realizada_em = i64::from_be_bytes(realizada_em_buf);
+
+        Ok(Self {
+            valor,
+            tipo: match tipo {
+                b'c' => TransactionType::Credit,
+                b'd' => TransactionType::Debit,
+                _ => return Err("Tipo de transação inválido"),
+            },
+            descricao: Description(String::from_utf8(descricao).unwrap()),
+            realizada_em: match OffsetDateTime::from_unix_timestamp(realizada_em) {
+                Ok(dt) => dt,
+                Err(_) => return Err("Data de transação inválida"),
+            },
+        })
+    }
+}
+
 struct Account {
     limit: i32,
     id: i32,
@@ -60,99 +107,54 @@ struct TransactionResult {
     limite: i32,
 }
 
+struct AccountExtract {
+    balance: i32,
+    transactions: Vec<Transaction>,
+}
+
 impl Account {
     fn new(limit: i32, id: i32) -> Self {
-        Account {
-            limit,
-            id
-        }
+        Account { limit, id }
     }
 
-    async fn do_transaction(&mut self, t: Transaction, db: &Pool<Postgres>) -> Result<TransactionResult, &str> {
-        let balance = self.balance(db).await.unwrap() as i32;
-
-        let bal = match t.tipo {
-            TransactionType::Credit => t.valor + balance,
-            TransactionType::Debit => {
-                if self.limit + balance < t.valor {
-                    return Err("O valor ultrapassa o limite da conta");
-                }
-
-                balance - t.valor
+    async fn do_transaction(&mut self, t: Transaction) -> Result<TransactionResult, &str> {
+        let mut db = match db::Connection::connect("8080".into()).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("{:?}", e);
+                return Err("Erro ao conectar com o banco de pobre");
             }
         };
 
-        let mut tx = match db.begin().await {
-            Ok(tx) => tx,
-            Err(_) => return Err("Erro ao iniciar transação"),
+        let new_bal = match db.insert_transaction(&t, self.id).await {
+            Ok(bal) => bal,
+            Err(e) => {
+                eprintln!("{:?}", e);
+                return Err("Erro ao inserir transação no banco de pobre");
+            }
         };
 
-        match sqlx::query(
-            "INSERT INTO transacoes (cliente_id, valor, descricao, tipo) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(1)
-        .bind(t.valor as i16)
-        .bind(t.descricao.0.clone())
-        .bind(match t.tipo {
-            TransactionType::Credit => "c",
-            TransactionType::Debit => "d",
+        Ok(TransactionResult {
+            saldo: new_bal,
+            limite: self.limit,
         })
-        .execute(&mut *tx)
-        .await
-        {
-            Ok(_) => (),
-            Err(_) => return Err("Erro ao inserir transação"),
-        }
-
-        match tx.commit().await {
-            Ok(_) => Ok(TransactionResult {
-                saldo: bal,
-                limite: self.limit,
-            }),
-            Err(_) => Err("Erro ao finalizar transação"),
-        }
     }
 
-    async fn transactions(&self, id: i16, db: &Pool<Postgres>) -> Result<Vec<Transaction>, &str> {
-        let rows = match query("SELECT valor, descricao, tipo, realizada_em FROM transacoes WHERE cliente_id = ($1) ORDER BY realizada_em DESC LIMIT 10")
-            .bind(id)
-            .fetch_all(db)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(_) => return Err("Erro ao buscar transações"),
-            };
-
-        Ok(rows
-            .iter()
-            .map(|row| {
-                Ok(Transaction {
-                    valor: row.get("valor"),
-                    descricao: Description(row.get("descricao")),
-                    tipo: match row.get("tipo") {
-                        "c" => TransactionType::Credit,
-                        "d" => TransactionType::Debit,
-                        _ => return Err("Tipo de transação inválido"),
-                    },
-                    realizada_em: row.get("realizada_em"),
-                })
-            })
-            .collect::<Result<Vec<Transaction>, &str>>()?)
-    }
-
-    async fn balance(&self, db: &Pool<Postgres>) -> Result<i64, &str> {
-        let row = match query("SELECT SUM(CASE WHEN tipo = 'd' THEN -valor ELSE valor END) as saldo FROM transacoes WHERE cliente_id = $1")
-            .bind(self.id)
-            .fetch_one(db)
-            .await
-        {
-            Ok(row) => row,
-            Err(_) => return Err("Erro ao buscar saldo"),
+    async fn transactions(&self) -> Result<AccountExtract, &str> {
+        let mut pobre_db = match db::Connection::connect("8080".into()).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("{:?}", e);
+                return Err("Erro ao conectar com o banco de pobre");
+            }
         };
 
-        match row.try_get("saldo") {
-            Ok(saldo) => Ok(saldo),
-            Err(_) => Ok(0),
+        match pobre_db.get_transactions(self.id).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                eprintln!("{:?}", e);
+                return Err("Erro ao buscar transações no banco de pobre");
+            }
         }
     }
 }
@@ -161,13 +163,11 @@ type Accounts = HashMap<u8, RwLock<Account>>;
 
 struct AppState {
     accounts: Accounts,
-    db: Pool<Postgres>,
 }
 
 impl AppState {
     async fn new(accounts: Accounts) -> Self {
-        let db = connect_to_db().await;
-        AppState { accounts, db }
+        AppState { accounts }
     }
 }
 
@@ -207,15 +207,6 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn connect_to_db() -> Pool<Postgres> {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL not found");
-    PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await
-        .expect("Failed to connect to database")
-}
-
 async fn create_transaction(
     Path(id): Path<u8>,
     State(app_state): State<Arc<AppState>>,
@@ -224,9 +215,12 @@ async fn create_transaction(
     match app_state.accounts.get(&id) {
         Some(acc) => {
             let mut account = acc.write().await;
-            match account.do_transaction(transaction, &app_state.db).await {
+            match account.do_transaction(transaction).await {
                 Ok(result) => Ok(Json(json!(result))),
-                Err(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+                Err(e) => {
+                    println!("{e}");
+                    return Err(StatusCode::UNPROCESSABLE_ENTITY);
+                }
             }
         }
         None => return Err(StatusCode::NOT_FOUND),
@@ -240,14 +234,14 @@ async fn get_transactions(
     match app_state.accounts.get(&id) {
         Some(acc) => {
             let account = acc.read().await;
-            if let Ok(transactions) = account.transactions(id as i16, &app_state.db).await {
+            if let Ok(transactions) = account.transactions().await {
                 Ok(Json(json!({
                     "saldo": {
-                        "total": account.balance(&app_state.db).await.unwrap(),
+                        "total": transactions.balance,
                         "data_extrato": OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),
                         "limite": account.limit,
                     },
-                    "ultimas_transacoes": transactions,
+                    "ultimas_transacoes": transactions.transactions,
                 })))
             } else {
                 Err(StatusCode::NOT_FOUND)

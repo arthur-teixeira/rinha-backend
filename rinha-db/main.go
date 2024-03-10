@@ -4,11 +4,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"sync"
 	"time"
 )
+
+const ROW_SIZE = 23
+const rowCountOffset = 1
 
 type Transaction struct {
 	Valor       int32
@@ -25,14 +29,14 @@ type Account struct {
 }
 
 type Database struct {
-	Capacity int
-	File     *os.File
-	row      int
-	rowSize  int
+	Capacity        int
+	File            *os.File
+	row             int
+	rowSize         int
 }
 
 func (d *Database) IncreaseRowCount() error {
-	d.row = (d.row + 1) % d.Capacity
+	d.row += 1 // (d.row + 1) % d.Capacity
 	_, err := d.File.Seek(0, 0)
 	if err != nil {
 		return err
@@ -42,12 +46,11 @@ func (d *Database) IncreaseRowCount() error {
 }
 
 func (d *Database) GetPosition() int64 {
-  const rowCountOffset = 1
-  return  int64(d.row*d.rowSize) + rowCountOffset
+	return int64((d.row%d.Capacity)*d.rowSize) + rowCountOffset
 }
 
 func (d *Database) Insert(t Transaction) error {
-  position := d.GetPosition()
+	position := d.GetPosition()
 	_, err := d.File.Seek(position, 0)
 	if err != nil {
 		return err
@@ -67,8 +70,7 @@ func (d *Database) Insert(t Transaction) error {
 }
 
 func (d *Database) GetTransaction(row int) (*Transaction, error) {
-	position := d.GetPosition()
-	_, err := d.File.Seek(position, 0)
+	_, err := d.File.Seek(int64(row*d.rowSize)+rowCountOffset, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +86,9 @@ func (d *Database) GetTransaction(row int) (*Transaction, error) {
 
 func (d *Database) GetTransactions() (*[]Transaction, error) {
 	var transactions []Transaction
-	for i := 0; i < d.row; i++ {
+	lim := int(math.Min(float64(d.row), float64(d.Capacity)))
+
+	for i := 0; i < lim; i++ {
 		t, err := d.GetTransaction(i)
 		if err != nil {
 			return nil, err
@@ -148,8 +152,7 @@ func (a *Account) GetTransactions() (*[]Transaction, error) {
 }
 
 func InitAccount(id int8) *Account {
-	// 15 bytes : 1 byte para o tipo, 4 para o valor, 10 para a descrição
-	db := InitDatabase(fmt.Sprintf("./account_%d.rinha", id), 10, 15)
+	db := InitDatabase(fmt.Sprintf("./account_%d.rinha", id), 10, ROW_SIZE)
 
 	return &Account{Id: id, Db: db, Balance: 0}
 }
@@ -188,22 +191,27 @@ func handleConnection(conn net.Conn, accounts map[int8]*Account) {
 		buf := make([]byte, 50)
 		_, err := conn.Read(buf)
 		if err != nil {
+			if err.Error() == "EOF" {
+				continue
+			}
 			fmt.Printf("Error reading message: %s", err.Error())
 		}
 
 		method := buf[0]
-		accountId := buf[1] - '0'
+		accountId := buf[1]
 		account, ok := accounts[int8(accountId)]
 
 		switch method {
 		case 'i':
 			if !ok {
-				log.Fatal("Account not found")
+				fmt.Printf("Account not found: %d\n", accountId)
+				return
 			}
 			err = insertTransaction(conn, buf[2:], account)
 		case 'g':
 			if !ok {
-				log.Fatal("Account not found")
+				fmt.Printf("Account not found: %d\n", accountId)
+				return
 			}
 			err = getTransactions(conn, account)
 		default:
@@ -213,32 +221,33 @@ func handleConnection(conn net.Conn, accounts map[int8]*Account) {
 		if err != nil {
 			fmt.Printf("Error writing message: %s\n", err.Error())
 		}
-
 	}
 }
 
 func getTransactions(conn net.Conn, account *Account) error {
-	err := binary.Write(conn, binary.BigEndian, account.Balance)
-	if err != nil {
-		return err
-	}
-
 	transactions, err := account.GetTransactions()
 	if err != nil {
 		return err
 	}
 
-	err = binary.Write(conn, binary.BigEndian, transactions)
+	responseSize := int32(binary.Size(transactions))
+
+	err = binary.Write(conn, binary.BigEndian, responseSize)
 	if err != nil {
 		return err
 	}
 
-	return nil
+	err = binary.Write(conn, binary.BigEndian, account.Balance)
+	if err != nil {
+		return err
+	}
+
+	return binary.Write(conn, binary.BigEndian, transactions)
 }
 
 func insertTransaction(conn net.Conn, buf []byte, account *Account) error {
 	transactionType := buf[0]
-	amount := binary.LittleEndian.Uint32(buf[1:5])
+	amount := binary.BigEndian.Uint32(buf[1:5])
 	description := buf[5:]
 	if len(description) < 10 {
 		description = append(description, make([]byte, 10-len(description))...)
