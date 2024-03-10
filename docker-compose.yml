@@ -9,7 +9,6 @@ services:
       - db
     environment:
       - PORT=3001
-      - DATABASE_URL=postgres://rinha:rinha@localhost:5432/rinha?sslmode=disable
     deploy:
       resources:
         limits:
@@ -20,7 +19,6 @@ services:
     <<: *api
     environment:
       - PORT=3000
-      - DATABASE_URL=postgres://rinha:rinha@localhost:5432/rinha?sslmode=disable
     hostname: api2
 
   load-balancer:
@@ -35,7 +33,7 @@ services:
       resources:
         limits:
           cpus: "0.1"
-          memory: "100MB"
+          memory: "50MB"
 
   db:
     build:
@@ -46,4 +44,4 @@ services:
       resources:
         limits:
           cpus: "1"
-          memory: "250MB"
+          memory: "300MB"

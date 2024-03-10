@@ -220,10 +220,7 @@ async fn create_transaction(
             let mut account = acc.write().await;
             match account.do_transaction(transaction, &app_state.db).await {
                 Ok(result) => Ok(Json(json!(result))),
-                Err(e) => {
-                    println!("{e}");
-                    return Err(StatusCode::UNPROCESSABLE_ENTITY);
-                }
+                Err(e) =>return Err(StatusCode::UNPROCESSABLE_ENTITY),
             }
         }
         None => return Err(StatusCode::NOT_FOUND),
