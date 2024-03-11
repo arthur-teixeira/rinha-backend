@@ -36,10 +36,7 @@ impl Connection {
         self.stream.write_all(&buf).await?;
         self.stream.flush().await?;
 
-        self.stream.readable().await?;
         let success = self.stream.read_u8().await?;
-
-        self.stream.readable().await?;
         let balance = self.stream.read_i32().await?;
 
         if success == 1 {
@@ -56,10 +53,7 @@ impl Connection {
         self.stream.write_all(&buf).await?;
         self.stream.flush().await?;
 
-        self.stream.readable().await?;
         let response_size = self.stream.read_i32().await?;
-
-        self.stream.readable().await?;
         let balance = self.stream.read_i32().await?;
 
         if response_size == 0 {
@@ -72,7 +66,6 @@ impl Connection {
         let mut response = Vec::with_capacity(response_size as usize);
 
         loop {
-            self.stream.readable().await?;
             match self.stream.read_buf(&mut response).await {
                 Ok(_) => break,
                 Err(e) => {
