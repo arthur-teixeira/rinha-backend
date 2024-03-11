@@ -23,7 +23,7 @@ type Transaction struct {
 }
 
 type Account struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	Id      int8
 	Balance int32
 	Limit   int32
@@ -38,7 +38,7 @@ type Database struct {
 }
 
 func (d *Database) IncreaseRowCount() error {
-	d.row += 1 // (d.row + 1) % d.Capacity
+	d.row += 1
 	_, err := d.File.Seek(0, 0)
 	if err != nil {
 		return err
@@ -62,11 +62,6 @@ func (d *Database) Insert(t Transaction) error {
 	if err != nil {
 		return err
 	}
-
-	// err = d.File.Sync()
-	// if err != nil {
-	// 	return err
-	// }
 
 	return d.IncreaseRowCount()
 }
@@ -150,11 +145,10 @@ func (a *Account) PerformTransaction(t Transaction) error {
 }
 
 func (a *Account) GetTransactions() (*[]Transaction, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 
 	return a.Db.GetTransactions()
-
 }
 
 func InitAccount(id int8, limit int32) *Account {
