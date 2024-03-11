@@ -9,13 +9,14 @@ import (
 	"math"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
-const ROW_SIZE = 23
+const ROW_SIZE = 27
 
 type Transaction struct {
 	Valor       int32
@@ -24,12 +25,18 @@ type Transaction struct {
 	RealizadaEm int64
 }
 
+type DBTransaction struct {
+  T Transaction
+  Id int32
+}
+
+
 type Account struct {
-	mu      sync.RWMutex
-	Id      int8
-	Balance int32
-	Limit   int32
-	Db      *Database
+	mu                   sync.RWMutex
+	Id                   int8
+	Balance              int32
+	Limit                int32
+	Db                   *Database
 }
 
 type File struct {
@@ -43,6 +50,7 @@ type Database struct {
 	File     *File
 	row      int
 	rowSize  int
+	CurrentTransactionId int32
 }
 
 func mmapFile(f *os.File, size int) *File {
@@ -124,8 +132,10 @@ func (d *Database) Insert(t Transaction) error {
 		return err
 	}
 
+  binary.Write(b, binary.BigEndian, d.CurrentTransactionId)
+
 	n, err := d.File.WriteAt(b.Bytes(), position)
-	if n != size {
+	if n != size + binary.Size(d.CurrentTransactionId) {
 		panic("Error writing transaction")
 	}
 
@@ -134,22 +144,28 @@ func (d *Database) Insert(t Transaction) error {
 	}
 
 	d.row += 1
+  d.CurrentTransactionId += 1
 
 	return nil
 }
 
-func (d *Database) GetTransactions() (*[]Transaction, error) {
-	var transactions []Transaction
+func (d *Database) GetTransactions() (*[]DBTransaction, error) {
+	var transactions []DBTransaction
 
 	limit := int(math.Min(float64(d.Capacity), float64(d.row)))
 	for row := 0; row < limit; row++ {
 		row_content := d.File.data[row*d.rowSize : (row+1)*d.rowSize]
-		transactions = append(transactions, Transaction{
+    t := Transaction{
 			Valor:       int32(binary.BigEndian.Uint32(row_content[0:4])),
 			Descricao:   [10]byte(row_content[4:14]),
 			Tipo:        row_content[14],
 			RealizadaEm: int64(binary.BigEndian.Uint64(row_content[15:23])),
-		})
+		}
+
+		transactions = append(transactions, DBTransaction{
+      T: t,
+      Id: int32(binary.BigEndian.Uint32(row_content[23:27])),
+    })
 	}
 
 	return &transactions, nil
@@ -186,7 +202,6 @@ func (a *Account) PerformTransaction(t Transaction) error {
 			return errors.New("ENOBALANCE")
 		}
 	}
-
 	return a.Db.Insert(t)
 }
 
@@ -194,7 +209,21 @@ func (a *Account) GetTransactions() (*[]Transaction, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	return a.Db.GetTransactions()
+  dbTransactions, err := a.Db.GetTransactions()
+  if err != nil {
+    return nil, err
+  }
+
+  sort.SliceStable(*dbTransactions, func (i, j int) bool {
+    return (*dbTransactions)[i].Id > (*dbTransactions)[j].Id
+  })
+
+  var result []Transaction
+  for _, t := range *dbTransactions {
+    result = append(result, t.T)
+  }
+
+  return &result, nil
 }
 
 func InitAccount(id int8, limit int32) *Account {
