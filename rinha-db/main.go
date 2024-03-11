@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,11 +10,12 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 const ROW_SIZE = 23
-const rowCountOffset = 1
 
 type Transaction struct {
 	Valor       int32
@@ -30,101 +32,145 @@ type Account struct {
 	Db      *Database
 }
 
+type File struct {
+	data   []byte
+	length int64
+	dirty  bool
+}
+
 type Database struct {
 	Capacity int
-	File     *os.File
+	File     *File
 	row      int
 	rowSize  int
 }
 
-func (d *Database) IncreaseRowCount() error {
-	d.row += 1
-	_, err := d.File.Seek(0, 0)
+func mmapFile(f *os.File, size int) *File {
+	err := syscall.Ftruncate(int(f.Fd()), int64(size))
 	if err != nil {
-		return err
+		log.Fatalf("ftruncate %s: %v", f.Name(), err)
 	}
-	_, err = d.File.Write([]byte{byte(d.row)})
-	return err
+
+	data, err := syscall.Mmap(int(f.Fd()), 0, (size+4095)&^4095, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		log.Fatalf("mmap %s: %v", f.Name(), err)
+	}
+
+	return &File{
+		data:   data,
+		length: int64(size),
+		dirty:  false,
+	}
 }
 
-func (d *Database) GetPosition() int64 {
-	return int64((d.row%d.Capacity)*d.rowSize) + rowCountOffset
+var (
+	ErrUnmappedMemory  = errors.New("unmapped memory")
+	ErrIndexOutOfBound = errors.New("offset out of mapped region")
+)
+
+func (m *File) boundaryChecks(offset, numBytes int64) error {
+	if m.data == nil {
+		return ErrUnmappedMemory
+	} else if offset+numBytes > m.length || offset < 0 {
+		return ErrIndexOutOfBound
+	}
+
+	return nil
+}
+func (m *File) ReadAt(dest []byte, offset int64) (int, error) {
+	err := m.boundaryChecks(offset, 1)
+	if err != nil {
+		return 0, err
+	}
+
+	return copy(dest, m.data[offset:]), nil
+}
+
+func (m *File) WriteAt(src []byte, offset int64) (int, error) {
+	err := m.boundaryChecks(offset, 1)
+	if err != nil {
+		return 0, err
+	}
+
+	m.dirty = true
+	return copy(m.data[offset:], src), nil
+}
+
+func (m *File) Flush(flags int) error {
+	if !m.dirty {
+		return nil
+	}
+
+	_, _, err := syscall.Syscall(syscall.SYS_MSYNC,
+		uintptr(unsafe.Pointer(&m.data[0])), uintptr(m.length), uintptr(flags))
+	if err != 0 {
+		return err
+	}
+
+	m.dirty = false
+	return nil
 }
 
 func (d *Database) Insert(t Transaction) error {
-	position := d.GetPosition()
-	_, err := d.File.Seek(position, 0)
+	position := int64((d.row % d.Capacity) * d.rowSize)
+
+	var buf []byte
+	b := bytes.NewBuffer(buf)
+
+	size := binary.Size(t)
+
+	err := binary.Write(b, binary.BigEndian, t)
 	if err != nil {
 		return err
 	}
 
-	err = binary.Write(d.File, binary.BigEndian, t)
+	n, err := d.File.WriteAt(b.Bytes(), position)
+	if n != size {
+		panic("Error writing transaction")
+	}
+
 	if err != nil {
 		return err
 	}
 
-	return d.IncreaseRowCount()
-}
+	d.row += 1
 
-func (d *Database) GetTransaction(row int) (*Transaction, error) {
-	_, err := d.File.Seek(int64(row*d.rowSize)+rowCountOffset, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	var t Transaction
-	err = binary.Read(d.File, binary.BigEndian, &t)
-	if err != nil {
-		return nil, err
-	}
-
-	return &t, nil
+	return nil
 }
 
 func (d *Database) GetTransactions() (*[]Transaction, error) {
 	var transactions []Transaction
-	lim := int(math.Min(float64(d.row), float64(d.Capacity)))
 
-	for i := 0; i < lim; i++ {
-		t, err := d.GetTransaction(i)
-		if err != nil {
-			return nil, err
-		}
-
-		transactions = append(transactions, *t)
+	limit := int(math.Min(float64(d.Capacity), float64(d.row)))
+	for row := 0; row < limit; row++ {
+		row_content := d.File.data[row*d.rowSize : (row+1)*d.rowSize]
+		transactions = append(transactions, Transaction{
+			Valor:       int32(binary.BigEndian.Uint32(row_content[0:4])),
+			Descricao:   [10]byte(row_content[4:14]),
+			Tipo:        row_content[14],
+			RealizadaEm: int64(binary.BigEndian.Uint64(row_content[15:23])),
+		})
 	}
 
 	return &transactions, nil
 }
 
 func InitDatabase(filePath string, capacity int, rowSize int) *Database {
-	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0755)
+	f, err := os.Create(filePath)
 	if err != nil {
-		log.Fatalf("Error opening file: %s", err)
+		log.Fatalf("Error creating file: %s", err)
 	}
 
-	rowCount := make([]byte, 1)
-	_, err = file.Read(rowCount)
-	if err != nil {
-		if err.Error() == "EOF" {
-			rowCount[0] = 0
-			_, err = file.Write([]byte{0})
-			if err != nil {
-				log.Fatalf("Error reading file: %s", err)
-			}
-		}
-
-		_, err = file.Seek(1, 0)
-		if err != nil {
-			log.Fatalf("Error reading file: %s", err)
-		}
+	file := mmapFile(f, capacity*rowSize)
+	if file == nil {
+		log.Fatalf("Error memory mapping file")
 	}
 
 	if err != nil {
 		log.Fatalf("Error reading file: %s", err)
 	}
 
-	return &Database{Capacity: capacity, File: file, row: int(rowCount[0]), rowSize: rowSize}
+	return &Database{Capacity: capacity, File: file, row: 0, rowSize: rowSize}
 }
 
 func (a *Account) PerformTransaction(t Transaction) error {
@@ -225,6 +271,7 @@ func handleConnection(conn net.Conn, accounts map[int8]*Account) {
 
 		if err != nil {
 			fmt.Printf("Error writing message: %s\n", err.Error())
+			return
 		}
 	}
 }
