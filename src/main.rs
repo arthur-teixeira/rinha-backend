@@ -63,6 +63,8 @@ impl Transaction {
             result.push(Self::from_binary(row)?);
         }
 
+        result.sort_by(|a, b| b.realizada_em.cmp(&a.realizada_em));
+
         Ok(result)
     }
 
